@@ -62,7 +62,7 @@ def fig_architecture():
                     label, ha="left" if vertical else "center", va="center", fontsize=9.5, color=MUTED)
 
     ax = axes[0]
-    ax.set_title("Original design (Apr 2026): SkyPilot + verl")
+    ax.set_title("First design: SkyPilot + verl")
     box(ax, 0.2, 5.8, 4, 2.6, "Trainer", "8×H100 on-demand\nverl GRPO + vLLM rollout", S1)
     box(ax, 5.8, 5.8, 4, 2.6, "Bench queue", "FastAPI + Redis (CPU)\ncontent-hash cache", S2)
     box(ax, 5.8, 1.0, 4, 2.6, "Bench workers", "N× A10/L4 spot\nAutoKernel bench.py", S3)
@@ -72,7 +72,7 @@ def fig_architecture():
     ax.text(0.2, 2.2, "~$27/hr (README cost model)\n3 clusters, HTTP-coupled", fontsize=10.5, color=INK2)
 
     ax = axes[1]
-    ax.set_title("Re-run (Sept 2026): Modal, ≤10 GPUs")
+    ax.set_title("As run: Modal, ≤10 GPUs")
     box(ax, 0.2, 5.8, 4, 2.6, "Trainer", "1×H100, LoRA r=64\nGRPO loop (verl semantics)", S1)
     box(ax, 5.8, 5.8, 4, 2.6, "Policy", "1×H100 vLLM 0.8.5\nLoRA hot-swap per step", S4)
     box(ax, 5.8, 1.0, 4, 2.6, "Bencher", "≤8× L4 autoscaled\nfull bench, Dict cache", S3)

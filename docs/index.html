@@ -3,210 +3,184 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Kernel-Writer-RL-v2</title>
-<meta name="description" content="Teaching a 7B code model to write Triton GPU kernels with a GPU-verified reward: GRPO, verifier fixes, and SFT-before-RL. An honest write-up of mixed results.">
-<meta name="color-scheme" content="light dark">
-<link rel="stylesheet" href="assets/site.css">
-<script src="assets/bind.js" defer></script>
+<title>What I learned training an LLM to write GPU kernels with GRPO</title>
+<meta name="description" content="What a GPU benchmark taught me about verifier bugs, useful rewards, and teaching correctness before speed.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400..700;1,6..72,400..600&family=IBM+Plex+Sans:wght@400;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="assets/style.css">
 </head>
 <body>
-<a class="skip" href="#main">Skip to content</a>
-
-<header class="site-header">
-  <div class="wrap">
-    <a class="brand" href="index.html">Kernel-Writer-RL<span>v2</span></a>
-    <nav class="nav" aria-label="Site">
-      <a href="index.html">Home</a>
-      <a href="method.html">Method</a>
-      <a href="rl.html">RL results</a>
-      <a href="verifier.html">Verifier</a>
-      <a href="sft.html">SFT</a>
-      <a href="reproduce.html">Reproduce</a>
-    </nav>
-  </div>
+<main>
+<article>
+<header>
+<h1>What I learned training an LLM to write GPU kernels with GRPO</h1>
+<p class="meta">April 2026</p>
 </header>
+<p>The most promising kernel in my GRPO experiment was an RMSNorm implementation that benchmarked at roughly 2.9× faster than eager PyTorch. When I measured it against the starter kernel, the improvement disappeared. When I checked its numerical behavior, it returned zeros on inputs the starter handled correctly. The benchmark had rewarded it for reproducing a bug in the reference.</p>
+<p>I built this project to see whether a small coding model could learn to write faster Triton kernels by proposing code, running it on a GPU, and learning from the results. Kernels seemed like a good fit for reinforcement learning with verifiable rewards: check the output, measure the runtime, assign a score. <strong>What I learned was that a GPU benchmark only becomes a useful reward after you establish that it measures correctness honestly and can distinguish improvement from noise.</strong></p>
+<p>The useful results came from auditing that chain. I fixed the verifiers, improved the feedback, inspected the advantages, and eventually switched to supervised fine-tuning. That taught the model to produce more correct kernels. Learning to make them faster remains unfinished.</p>
+<p>The findings I would carry into another run:</p>
+<ul>
+<li>A passing kernel can expose a broken reference. Test the verifier itself before trusting its rewards.</li>
+<li>GRPO needs meaningful differences within each group; a noise threshold keeps tiny timing differences from driving updates.</li>
+<li>Partial credit gives the model a learning signal before a full pass, but that signal does not guarantee new solutions.</li>
+<li>Supervised fine-tuning improved correctness and transfer; speed barely moved.</li>
+</ul>
+<h2 id="the-setup">The setup</h2>
+<p>The model received a PyTorch reference and a starter kernel, then wrote a complete <code>kernel.py</code>. The benchmark ran that file on a real GPU and returned results for the next revision.</p>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th>Piece</th>
+<th>Configuration</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Task</td>
+<td>Nine kernel types, including softmax, layernorm, RMSNorm, and matmul</td>
+</tr>
+<tr>
+<td>Policy</td>
+<td>Qwen2.5-Coder-7B-Instruct, with LoRA rank 64</td>
+</tr>
+<tr>
+<td>Verifier</td>
+<td>AutoKernel: five correctness stages, then timing against eager PyTorch</td>
+</tr>
+<tr>
+<td>Reward</td>
+<td>Partial credit for correctness progress; a full-pass floor of 0.5 plus a clipped log-speedup bonus</td>
+</tr>
+<tr>
+<td>Training episode</td>
+<td>Propose → benchmark → read feedback → revise, with four turns</td>
+</tr>
+<tr>
+<td>GRPO</td>
+<td>Eight episodes per task; group-normalized advantages with a 0.02 noise threshold; one on-policy update; no KL penalty</td>
+</tr>
+<tr>
+<td>Compute</td>
+<td>Modal: one trainer GPU, one vLLM policy GPU, up to eight benchmark GPUs</td>
+</tr>
+</tbody>
+</table></div>
+<p>I expected the starter code to give the model a foothold: begin with a working implementation, explore changes, and reinforce the ones that improved runtime. The experiment depended on two things: whether the benchmark judged correctness reliably, and whether the sampled episodes gave the optimizer useful choices.</p>
+<h2 id="1-the-verifier-can-reward-the-wrong-answer">1. The verifier can reward the wrong answer</h2>
+<p>The benchmark checked more than whether the code compiled. It tested shapes, numerical stability, determinism, and edge cases. That made the reward look convincing. RMSNorm showed why even a detailed test suite needs an independent check of its reference.</p>
+<p>The apparent 2.9× win came from fusion that was already in the starter. Eager PyTorch performed the operation through six kernel launches; the starter fused it. Independent remeasurement put the model's edit at 1.004× relative to the starter at the primary shape, and a geometric mean of 0.999× across 32 configurations. There was no meaningful speed improvement attributable to the edit.</p>
+<p>The substantive changes were two casts from float32 to float16:</p>
+<pre><code class="language-diff"><span class="del">- x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)</span>
+<span class="add">+ x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float16)</span>
+<span class="del">- w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)</span>
+<span class="add">+ w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float16)</span>
+</code></pre>
+<p>Those casts made the RMS calculation overflow. At a row width of 4096, rows with RMS above roughly 4 could become all zeros. The benchmark reference also overflowed on its large-magnitude test, so the broken implementation agreed with it and passed. The starter accumulated in float32, produced the correct result, and failed that check.</p>
+<p>This is a particularly uncomfortable failure mode for RL: improving numerical accuracy could lower the reward. The model found a change that satisfied the verifier, exactly as the training objective requested.</p>
+<p>For independent evaluation, I used higher-precision references, adversarial magnitudes, and fresh inputs. The RMSNorm candidate failed those checks. Its measured advantage over eager PyTorch was real, but the useful optimization was inherited from the starter, and the model's change damaged correctness.</p>
+<p>I learned to ask two separate questions about every apparent win: does the output remain correct against an independent reference, and how much of the speedup comes from the model's edit? Comparing only with eager PyTorch could not answer the second question.</p>
+<p>Before another training run, I would give the verifier deliberately wrong kernels, an accurate implementation, and the reference itself. I would want to understand every disagreement before using the verdict as a reward.</p>
+<h2 id="2-feedback-has-to-explain-what-failed">2. Feedback has to explain what failed</h2>
+<p>The model received structured benchmark results and the failing check's lines, with crash details when relevant. I wanted each observation to point toward a concrete repair: a compile error, an incorrect shape, a numerical mismatch, or a launch failure.</p>
+<p>That detail matters in a multi-turn task. The model cannot inspect the GPU directly. Its entire view of the execution comes through the message returned by the benchmark. If that message omits the failing case, the next revision starts with incomplete evidence.</p>
+<p>Even useful feedback cannot substitute for the skill to act on it. On the held-out validation set, the base model had a per-turn compile-error rate of 8.1%, and its repeat-same-error rate was 0.338. More turns gave it more opportunities, but recurring failures showed that some of those opportunities were being spent on unsuccessful repairs.</p>
+<p>Each extra turn costs generation and a GPU benchmark. Before increasing the turn budget, I would read complete conversations and identify what stopped the model from making progress. That inspection also tells me what repair examples to collect for supervised training.</p>
+<h2 id="3-grpo-needs-differences-it-can-trust">3. GRPO needs differences it can trust</h2>
+<p>GRPO compares episodes sampled for the same task. In my implementation, the advantage was approximately:</p>
+<pre><code class="language-text">if group standard deviation &lt;= 0.02:
+    advantage = 0
+else:
+    advantage = (episode reward − group mean) / group standard deviation
+</code></pre>
+<p>If every episode receives the same reward, the group offers no preference to learn from. A group with tiny differences is also suspect: dividing by a tiny standard deviation can amplify measurement noise into a substantial update weight.</p>
+<p>I used a threshold of 0.02 to suppress that small-variation regime. Across the ten-step run, an average of <strong>37.8% of groups had zero advantage</strong>, including both exact ties and groups suppressed by the threshold.</p>
+<p><img loading="lazy" alt="GRPO groups split into update-bearing groups, exact ties, and groups below the noise threshold" src="figures/grpo_group_signal.png" />
+<em>Across 90 groups, 56 contribute an update; 21 tie exactly and 13 fall below the noise threshold. <a href="figures/grpo_group_signal.excalidraw">Editable diagram</a>.</em></p>
+<p>An offline recomputation showed why the threshold mattered. Without it, groups with nonzero reward standard deviation below 0.02 would have accounted for 17.4% of total absolute advantage. With the threshold used in training, their contribution was zero.</p>
+<p>This is a comparison of update weights on the same rollouts, not a separate training experiment. It measures advantage mass rather than the exact parameter gradient, and the threshold does not prove that every small difference is noise. It makes explicit how much variation I am willing to trust.</p>
+<p>The remaining challenge was whether the groups with a signal contained choices that would teach the model to complete harder kernels. A nonzero advantage tells me the optimizer can update. It does not tell me that the preference is useful enough to improve the task.</p>
+<h2 id="4-partial-credit-gave-signal-without-clear-skill-gains">4. Partial credit gave signal without clear skill gains</h2>
+<p>The reward gave partial credit for correctness progress through the smoke test, shape sweep, and numerical-stability checks. A full pass always scored above partial progress:</p>
+<pre><code class="language-text">Any passing turn:
+    reward = 0.5 + clip(log2(best passing speedup), 0, 3)
 
-<main id="main" class="wrap">
-
-  <section class="hero">
-    <h1>Can reinforcement learning teach a small model to write faster GPU kernels?</h1>
-    <p class="lede">
-      An LLM agent writes a Triton kernel, a real GPU checks and times it, and the result is the reward.
-      This project re-ran that loop end to end, trained it with GRPO, then audited the verifier and
-      tried supervised fine-tuning first. The results are mixed, and this site reports them as they are.
-    </p>
-    <p class="byline">Research write-up · Qwen2.5-Coder-7B-Instruct · Triton · Modal</p>
-    <p class="thesis">
-      GRPO stalled: most of its learning signal came from all-fail groups and benchmark timing noise.
-      After fixing the verifier, SFT on verified kernels made the model noticeably more <em>correct</em>,
-      but not <em>faster</em>.
-    </p>
-    <div class="meta">
-      <span class="tag navy">GRPO v1 / v2</span>
-      <span class="tag navy">verifier audit</span>
-      <span class="tag navy">SFT-before-RL</span>
-      <span class="tag amber">results: mixed</span>
-    </div>
-  </section>
-
-  <section class="block" aria-labelledby="h-numbers">
-    <h2 id="h-numbers">Headline numbers</h2>
-    <p class="muted small">Every number below is read from the result JSON in <code>results/</code> when the page loads.</p>
-
-    <div class="stats">
-      <div class="stat">
-        <div class="stat-num">
-          <span class="from"><span data-k="phase3.json:val.base.pass@1" data-fmt="f3">0.383</span></span><span class="arrow" aria-label="to">→</span><span data-k="phase3.json:val.sft.pass@1" data-fmt="f3">0.508</span>
-        </div>
-        <div class="stat-label">Validation pass@1, base → SFT</div>
-        <div class="stat-note"><span data-k="phase3.json:val.sft.problems" data-fmt="int">62</span> held-out problems; a solve must PASS the full verifier and differ from the starter.</div>
-      </div>
-
-      <div class="stat">
-        <div class="stat-num">
-          <span class="from"><span data-k="phase3.json:kernelbench.kb2_base.fast_0_triton" data-fmt="pct0">0%</span></span><span class="arrow" aria-label="to">→</span><span data-k="phase3.json:kernelbench.kb2_sft_v1.fast_0_triton" data-fmt="pct0">20%</span>
-        </div>
-        <div class="stat-label">KernelBench L1 solved with a real Triton kernel</div>
-        <div class="stat-note">Of <span data-k="phase3.json:kernelbench.kb2_sft_v1.tasks" data-fmt="int">100</span> problems. On problems whose ops the SFT data never covered: <span data-k="phase3.json:kernelbench_seen_split.kb2_sft_v1.solved_unseen" data-fmt="int">7</span>/<span data-k="phase3.json:kernelbench_seen_split.kb2_sft_v1.unseen_problems" data-fmt="int">59</span>.</div>
-      </div>
-
-      <div class="stat">
-        <div class="stat-num">
-          <span class="from"><span data-k="phase3.json:val.base.compile_error_rate" data-fmt="pct1">8.1%</span></span><span class="arrow" aria-label="to">→</span><span data-k="phase3.json:val.sft.compile_error_rate" data-fmt="pct1">1.9%</span>
-        </div>
-        <div class="stat-label">Triton compile errors per turn, base → SFT</div>
-        <div class="stat-note">Compile errors as a share of failures: <span data-k="phase3.json:val.base.compile_share_of_failures" data-fmt="pct1">16.1%</span> → <span data-k="phase3.json:val.sft.compile_share_of_failures" data-fmt="pct1">3.8%</span>.</div>
-      </div>
-
-      <div class="stat is-neg">
-        <div class="stat-num"><span data-k="extra_numbers.json:dr_grpo_whatif.grpo_v1.abs_adv_mass_share_from_noise_groups_pct.grpo_std_as_trained" data-fmt="f1">78.9</span>%</div>
-        <div class="stat-label">of GRPO v1's advantage came from timing noise</div>
-        <div class="stat-note">Groups whose rewards differ only by bench noise (std &lt; 0.02) get amplified by std-normalisation. Without the std division (Dr. GRPO): <span data-k="extra_numbers.json:dr_grpo_whatif.grpo_v1.abs_adv_mass_share_from_noise_groups_pct.dr_grpo_no_std" data-fmt="f1">6.2</span>%.</div>
-      </div>
-
-      <div class="stat is-neg">
-        <div class="stat-num">
-          <span class="from"><span data-k="numbers.json:grpo.grpo_v1.pass_first3" data-fmt="pct1">29.2%</span></span><span class="arrow" aria-label="to">→</span><span data-k="numbers.json:grpo.grpo_v1.pass_last3" data-fmt="pct1">25.0%</span>
-        </div>
-        <div class="stat-label">GRPO v1 pass rate, first → last 3 steps</div>
-        <div class="stat-note"><span data-k="numbers.json:grpo.grpo_v1.steps" data-fmt="int">18</span> steps. <span data-k="extra_numbers.json:dr_grpo_whatif.grpo_v1.dapo_filter_removed_groups_pct" data-fmt="f1">65.4</span>% of groups had identical rewards and gave no gradient.</div>
-      </div>
-
-      <div class="stat is-neg">
-        <div class="stat-num"><span data-k="phase3.json:val.sft.speedup_vs_starter_geomean" data-fmt="x2">1.00×</span></div>
-        <div class="stat-label">SFT speedup over the starter kernel (geomean)</div>
-        <div class="stat-note">Correct, not faster: SFT beats the starter on <span data-k="phase3.json:val.sft.beat_starter@1" data-fmt="pct1">0.8%</span> of attempts (base <span data-k="phase3.json:val.base.beat_starter@1" data-fmt="pct1">2.8%</span>).</div>
-      </div>
-    </div>
-
-    <div class="callout">
-      <p><strong>What this does and does not show.</strong> SFT improved correctness on a held-out set and on KernelBench,
-      which the GRPO runs never did. It did not produce speedups, and GRPO was not resumed on top of SFT (budget),
-      so whether RL can add speed from this starting point is still open.</p>
-    </div>
-  </section>
-
-  <section class="block" aria-labelledby="h-timeline">
-    <h2 id="h-timeline">How the project unfolded</h2>
-    <ol class="timeline">
-      <li>
-        <span class="when">Apr 2026</span>
-        <div class="what">
-          <h3>Original design</h3>
-          <p>GRPO on SkyPilot + verl: the agent writes a full Triton <code>kernel.py</code>, AutoKernel's bench checks correctness and times it against PyTorch, and the reward is the log speedup. KernelBench was the first test set. All original results were lost with an old disk.</p>
-        </div>
-      </li>
-      <li>
-        <span class="when">Sept 2026</span>
-        <div class="what">
-          <h3>Re-run on Modal</h3>
-          <p>Rebuilt every stage on Modal. Harness checks found real bugs: only <span data-k="numbers.json:kb_sanity.valid" data-fmt="int">55</span> of 100 KernelBench L1 problems were harness-valid, and only <span data-k="numbers.json:stage1.starters_pass_full.L4" data-fmt="int">3</span> of 9 AutoKernel starter kernels passed the full bench.</p>
-        </div>
-      </li>
-      <li class="key">
-        <span class="when">Sept 2026</span>
-        <div class="what">
-          <h3>GRPO v1 and v2</h3>
-          <p>v1 (original reward, <span data-k="numbers.json:grpo.grpo_v1.steps" data-fmt="int">18</span> steps) and v2 (dense correctness credit plus a noise floor, <span data-k="numbers.json:grpo.grpo_v2.steps" data-fmt="int">10</span> steps). Reward barely moved, the pass rate stayed flat, and no kernel type that failed at the start was ever solved.</p>
-        </div>
-      </li>
-      <li>
-        <span class="when">Late Sept 2026</span>
-        <div class="what">
-          <h3>Verifier fixes</h3>
-          <p>Fixed bench and KernelBench harnesses (now <span data-k="phase3.json:kernelbench.kb2_base.tasks" data-fmt="int">100</span> of 100 valid). Re-measuring GRPO's best RMSNorm kernel showed its speedup was already in the starter, and its fp16 edit was a reward hack the old verifier could not see.</p>
-        </div>
-      </li>
-      <li>
-        <span class="when">Oct 2026</span>
-        <div class="what">
-          <h3>SFT Phase 0: clean baseline</h3>
-          <p>Following an SFT-before-RL plan (drafted Sept 30), fixed the broken starters and the prompt protocol, built a <span data-k="phase3.json:val.base.problems" data-fmt="int">62</span>-problem validation set, and measured the base model: pass@1 <span data-k="phase3.json:val.base.pass@1" data-fmt="f3">0.383</span>.</p>
-        </div>
-      </li>
-      <li>
-        <span class="when">Oct 2026</span>
-        <div class="what">
-          <h3>SFT Phase 1: verified data</h3>
-          <p>Ingested Dr.Kernel, KernelBook and in-repo kernels, ran every candidate through the GPU verifier and decontaminated against KernelBench: <span data-k="mix_report.json:splits.train.examples" data-fmt="int">3,022</span> train / <span data-k="mix_report.json:splits.dev.examples" data-fmt="int">60</span> dev examples, <span data-k="mix_report.json:splits.train.by_repair.true" data-fmt="int">453</span> of them multi-turn repairs.</p>
-        </div>
-      </li>
-      <li>
-        <span class="when">Oct 2026</span>
-        <div class="what">
-          <h3>SFT Phase 2: LoRA fine-tune</h3>
-          <p>LoRA SFT of Qwen2.5-Coder-7B-Instruct on the verified mix, with a pilot-resumable trainer on Modal.</p>
-        </div>
-      </li>
-      <li class="key">
-        <span class="when">Oct 7, 2026</span>
-        <div class="what">
-          <h3>SFT Phase 3: evaluation</h3>
-          <p>Validation pass@1 <span data-k="phase3.json:val.base.pass@1" data-fmt="f3">0.383</span> → <span data-k="phase3.json:val.sft.pass@1" data-fmt="f3">0.508</span>; KernelBench Triton PASS <span data-k="phase3.json:kernelbench.kb2_base.fast_0_triton" data-fmt="pct0">0%</span> → <span data-k="phase3.json:kernelbench.kb2_sft_v1.fast_0_triton" data-fmt="pct0">20%</span>; no speedup. All three gates for resuming GRPO passed, but GRPO was not resumed (budget).</p>
-        </div>
-      </li>
-    </ol>
-  </section>
-
-  <section class="block" aria-labelledby="h-explore">
-    <h2 id="h-explore">Explore</h2>
-    <div class="cards">
-      <a class="card" href="method.html">
-        <h3>Method</h3>
-        <p>The agent loop, the GPU-verified reward, the model and the Modal infrastructure.</p>
-        <span class="go">Read the method →</span>
-      </a>
-      <a class="card" href="rl.html">
-        <h3>RL results</h3>
-        <p>GRPO v1 and v2 training curves, zero-advantage groups, and why timing noise dominated the signal.</p>
-        <span class="go">See the GRPO runs →</span>
-      </a>
-      <a class="card" href="verifier.html">
-        <h3>Verifier</h3>
-        <p>Harness bugs found on re-run, quick vs full bench, and the RMSNorm reward hack.</p>
-        <span class="go">Audit the verifier →</span>
-      </a>
-      <a class="card" href="sft.html">
-        <h3>SFT</h3>
-        <p>Phases 0–3: verified data mix, LoRA training, validation and KernelBench results.</p>
-        <span class="go">See the SFT results →</span>
-      </a>
-      <a class="card" href="reproduce.html">
-        <h3>Reproduce</h3>
-        <p>Deploy the Modal apps and run each stage; where every artifact lands in <code>results/</code>.</p>
-        <span class="go">Run it yourself →</span>
-      </a>
-    </div>
-  </section>
-
+No passing turn:
+    reward = 0.3 × best correctness progress across turns
+</code></pre>
+<p>This ordering rewards a correct kernel even when it is slower than PyTorch. It also distinguishes an episode that makes progress through the checks from one that fails immediately. Speed matters once the kernel passes.</p>
+<p>Across the first three and last three steps, mean training reward went from 0.371 to 0.399. Episode pass rate stayed nearly flat, from 31.5% to 31.9%.</p>
+<p><img loading="lazy" alt="Training reward and episode pass rate across the GRPO run" src="figures/grpo_training.png" />
+<em>The ten-step run shows fluctuations in reward and little movement in pass rate. A higher reward average is insufficient evidence of a new capability. <a href="figures/grpo_training.excalidraw">Editable diagram</a>.</em></p>
+<p>The run produced passing episodes for cross-entropy, reduction, RMSNorm, and softmax under the training verifier, the same kernel types the base model could solve. RMSNorm's apparent success also needed the numerical audit described above. I could not count every benchmark pass as a correct solution.</p>
+<p>Ten steps are too few to establish what a longer run might achieve. Within this budget, partial correctness gave the optimizer more information, but I saw no expansion to newly solved kernel types. Completing the difficult kernels remained the bottleneck.</p>
+<p>That led me to a different question: could I first teach the model to write and repair valid Triton reliably enough for RL to have useful candidates to compare?</p>
+<h2 id="5-supervised-fine-tuning-improved-correctness-speed-stayed-flat">5. Supervised fine-tuning improved correctness; speed stayed flat</h2>
+<p>I assembled 3,022 training examples and 60 development examples from Dr. Kernel, kernels generated in this project, and KernelBook. The pipeline filtered and GPU-verified the examples, then removed detected KernelBench Level 1 overlap. Repair examples made up 15% of training: a broken kernel, its feedback, and a corrected response.</p>
+<p>Verification was consequential. Only 69 of 1,029 selected KernelBook rows passed the checks; many generated implementations hard-coded shapes and failed on a second shape. Code that looks like a useful kernel example still needs to satisfy the task you intend to teach.</p>
+<p>Most training examples came from Dr. Kernel, whose trajectories are distilled from GPT-5. The source provenance and terms are recorded in the mix report; the assembled datasets are not published.</p>
+<p>I trained the LoRA adapter for two epochs, or 378 steps, then compared it with the base model using evaluation harnesses with independent correctness checks.</p>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Base</th>
+<th>After SFT</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Validation pass@1, 62 problems</td>
+<td>0.383</td>
+<td>0.508</td>
+</tr>
+<tr>
+<td>Triton compile errors per turn</td>
+<td>8.1%</td>
+<td>1.9%</td>
+</tr>
+<tr>
+<td>KernelBench L1: correct with a Triton launch</td>
+<td>0/100</td>
+<td>20/100</td>
+</tr>
+<tr>
+<td>…and faster than eager PyTorch</td>
+<td>0/100</td>
+<td>10/100</td>
+</tr>
+<tr>
+<td>Geometric-mean speedup vs starter, solved validation episodes</td>
+<td>0.950×</td>
+<td>1.003×</td>
+</tr>
+</tbody>
+</table></div>
+<p><em>Validation pass@1 refers to one sampled episode with up to four proposals, not one code response. KernelBench uses one episode with up to three proposals and additionally checks for a Triton launch. Source: <code>results/v3/phase3.md</code>.</em></p>
+<p>The correctness gain was the clearest positive result in the project. Compile errors became much less frequent, and the model transferred to KernelBench: seven of its solutions were among 59 problems whose operations were classified as unseen in SFT.</p>
+<p>Speed remained close to the starter. Only two of 126 solved SFT validation episodes beat it by more than 5%. Even with a speed component in the reward, most available group variation would still come from passing versus failing.</p>
+<p>I did not resume GRPO after SFT because of the budget. These results support SFT as a better starting point for this model; they do not establish that SFT followed by RL would improve speed. That experiment is still open.</p>
+<h2 id="6-the-expensive-part-was-waiting-for-measurements">6. The expensive part was waiting for measurements</h2>
+<p>Collecting rollouts took 85.4% of step time; the policy update took 14.6%. The trainer GPU was idle during rollout collection. This run did not log generation and benchmarking separately, so I can report their combined cost in elapsed time.</p>
+<p><img loading="lazy" alt="Time spent collecting rollouts and updating the policy during GRPO" src="figures/grpo_step_time.png" />
+<em>Most step time goes into collecting episodes. The trainer only updates after generation and benchmarking finish. <a href="figures/grpo_step_time.excalidraw">Editable diagram</a>.</em></p>
+<p>This changes where I would spend engineering effort. Faster optimizer code would address a small fraction of elapsed time. Avoiding uninformative rollouts and overlapping collection with training could matter much more.</p>
+<p>The GRPO run cost an estimated $11.15 based on wall time. That is an estimate, not a bill. A realistic cost model also needs container startup, extra checks, hung jobs, and reruns; the rollout and update timers alone do not capture the whole experiment.</p>
+<p>A realistic reproduction budget needs the verifier debugging and remeasurement work as well as the training loop. In this project, those measurements were what made the training results interpretable.</p>
+<h2 id="what-i-would-try-next">What I would try next</h2>
+<ul>
+<li><strong>Build a curriculum from measured pass rates.</strong> Sample tasks where the SFT model sometimes succeeds, so groups can compare successful and unsuccessful attempts.</li>
+<li><strong>Compare mean-centered advantages with noise-thresholded normalization.</strong> Remeasure promising candidates independently before treating a small runtime difference as progress.</li>
+<li><strong>Separate correctness from speed in evaluation.</strong> Track passes, speed against the starter, and speed against <code>torch.compile</code> across shapes, so inherited fusion gains stay visible.</li>
+<li><strong>Improve repair data for recurring failures.</strong> Target the compile errors and repeated numerical mistakes observed in actual conversations.</li>
+<li><strong>Overlap rollouts with training.</strong> Keep the trainer working while benchmark workers collect the next batch, once the reward is trustworthy enough to justify more compute.</li>
+</ul>
+<p>I would make the next run earn its compute budget by showing that its groups contain meaningful choices. This project gave me a model that writes more correct Triton and a much better understanding of what my benchmark can claim. The remaining goal is to turn reliable correctness into reliable optimization.</p>
+<h2 id="code-and-data">Code and data</h2>
+<p>The code, reports, and measured results are in the <a href="https://github.com/Ramshankar07/Kernel-Writer-RL-v2">project repository</a>. The supporting artifacts are <code>results/numbers.json</code> for the agent evaluations and GRPO run, <code>results/extra_numbers.json</code> for the advantage and timing analyses, and <code>results/v3/</code> for verifier fixes, independent remeasurement, and SFT evaluation.</p>
+<p>The SFT datasets are not published. The ingestion, verification, decontamination, and assembly scripts are included so the data pipeline can be inspected and rebuilt.</p>
+</article>
 </main>
-
-<footer class="site-footer">
-  <div class="wrap">
-    <span><a href="https://github.com/Ramshankar07/Kernel-Writer-RL-v2">github.com/Ramshankar07/Kernel-Writer-RL-v2</a></span>
-    <span>Apache-2.0</span>
-  </div>
-</footer>
-
 </body>
 </html>
