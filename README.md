@@ -2,18 +2,13 @@
 
 An LLM agent (Qwen2.5-Coder-7B-Instruct) writes a full Triton `kernel.py`. A real GPU runs a
 fixed benchmark (correctness stages, then timing against PyTorch), and the result is the
-verifiable reward and the agent's next message. The original design (April 2026, SkyPilot + verl)
-is in [`src/`](src/). The original results were lost with an old disk, so every number here comes
-from the September 2026 re-run on Modal ([`modal_app/`](modal_app/)). That re-run trained the agent
-with GRPO, found and fixed bugs in both verifiers (AutoKernel `bench.py` and KernelBench
-`bench_kb.py`), and then tested SFT before more RL.
+verifiable reward and the agent's next message. The project ran in April 2026. The first design
+(SkyPilot + verl) is in [`src/`](src/); the experiments ran on Modal ([`modal_app/`](modal_app/)).
+They trained the agent with GRPO, found and fixed bugs in both verifiers (AutoKernel `bench.py` and
+KernelBench `bench_kb.py`), and then tested SFT before more RL.
 
-**Website:** https://ramshankar07.github.io/Kernel-Writer-RL-v2/
-([method](https://ramshankar07.github.io/Kernel-Writer-RL-v2/method.html) ·
-[RL](https://ramshankar07.github.io/Kernel-Writer-RL-v2/rl.html) ·
-[verifier](https://ramshankar07.github.io/Kernel-Writer-RL-v2/verifier.html) ·
-[SFT](https://ramshankar07.github.io/Kernel-Writer-RL-v2/sft.html) ·
-[reproduce](https://ramshankar07.github.io/Kernel-Writer-RL-v2/reproduce.html))
+**Blog post:** [What I learned training an LLM to write GPU kernels with GRPO](https://ramshankar07.github.io/Kernel-Writer-RL-v2/)
+(source: [`post/`](post/))
 
 ## Headline results
 
@@ -39,11 +34,11 @@ a real speed signal: most groups had no variance, and most of the variance it di
 
 ## Architecture
 
-![Architecture: original SkyPilot + verl design vs the Modal re-run](presentation/figures/01_architecture.png)
+![Architecture: the first SkyPilot + verl design and the Modal setup the experiments ran on](presentation/figures/01_architecture.png)
 
-The April 2026 design used three HTTP-coupled SkyPilot clusters: an 8-GPU verl trainer (H100:8 in
+The first design used three HTTP-coupled SkyPilot clusters: an 8-GPU verl trainer (H100:8 in
 the first commit, A100:8 with A40/L4 fallbacks in the last; `src/trainer.yaml`), a
-FastAPI + Redis bench queue, and spot GPU bench workers. The Modal re-run fits the same GRPO loop
+FastAPI + Redis bench queue, and spot GPU bench workers. The Modal setup fits the same GRPO loop
 under a 10-GPU cap. One H100 runs the trainer (LoRA r=64), one H100 serves the vLLM policy with the
 LoRA hot-swapped each step, and up to 8 autoscaled L4 benchers run the full AutoKernel bench behind
 a content-hash cache. KernelBench Level 1 on H100 is the held-out transfer eval.
@@ -52,8 +47,8 @@ a content-hash cache. KernelBench Level 1 on H100 is the held-out transfer eval.
 
 | Path | What is in it |
 |---|---|
-| [`src/`](src/) | Original April 2026 design: SkyPilot clusters, verl trainer config, bench server and worker, agent loop, reward ([`src/autokernel-rlvr/`](src/autokernel-rlvr/)) |
-| [`modal_app/`](modal_app/) | The Modal re-run: bench apps (v1 and fixed v2), KernelBench apps (v1 and v2), vLLM policy, agent eval, GRPO trainer, `reward_v2.py`, the SFT pipeline (`sft_*.py`), validation set and eval (`val_*.py`), report generators |
+| [`src/`](src/) | First design: SkyPilot clusters, verl trainer config, bench server and worker, agent loop, reward ([`src/autokernel-rlvr/`](src/autokernel-rlvr/)) |
+| [`modal_app/`](modal_app/) | The Modal implementation: bench apps (v1 and fixed v2), KernelBench apps (v1 and v2), vLLM policy, agent eval, GRPO trainer, `reward_v2.py`, the SFT pipeline (`sft_*.py`), validation set and eval (`val_*.py`), report generators |
 | [`results/`](results/) | Every measured number: `numbers.json` (stages 1 to 3), `extra_numbers.json` (GRPO analyses), `grpo/` (GRPO metrics and rollouts), `v3/` (verifier fixes, RMSNorm re-measurement, SFT phases 0 to 3) |
 | [`results/autokernel_src/`](results/autokernel_src/) | Vendored AutoKernel `bench.py`, `reference.py` and starter kernels (MIT) |
 | [`presentation/`](presentation/) | Figures (`figures/`, `v2/figures/`), decks (`deck.pptx`, `v3/deck_v3.pptx`), and generators for the write-up and the 30-question Q&A (`make_docs.py` → `writeup.md`, `qa_30.md`) |
@@ -127,7 +122,7 @@ Unit tests: `python modal_app/test_sft_assemble.py` and `python modal_app/test_s
 | [`results/v3/bench_v2.md`](results/v3/bench_v2.md) | Fixed AutoKernel harness, plus a rescore of every old PASS kernel |
 | [`results/v3/kb_v2.md`](results/v3/kb_v2.md) | Fixed KernelBench harness: identity sanity check 55/100 → 100/100 |
 | [`results/v3/sft_plan.md`](results/v3/sft_plan.md) | Why SFT before more GRPO, and the phase plan and gates |
-| [`presentation/writeup.md`](presentation/writeup.md) | Short write-up of the Modal re-run (stages 1 to 3, GRPO v1/v2) |
+| [`post/index.md`](post/index.md) | The blog post: what the verifier audit, GRPO runs and SFT taught me |
 
 ## Data and licenses
 
