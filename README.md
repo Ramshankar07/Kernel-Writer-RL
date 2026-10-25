@@ -16,6 +16,21 @@ An LLM agent (Qwen2.5-Coder-7B-Instruct) writes Triton kernels. A GPU benchmark 
 GRPO did not improve the model: most groups had no reward variance, and 78.9% of the advantage came from timing noise.
 Sources: [`results/v3/phase3.md`](results/v3/phase3.md), [`results/extra_numbers.json`](results/extra_numbers.json).
 
+## AMD MI300X
+
+The same loop also targets AMD Instinct MI300X (CDNA3, gfx942) and was tested on RunPod MI300X pods.
+Those run logs are not in this repo, so the results above are NVIDIA only.
+
+| File | Role |
+|---|---|
+| [`bench_worker/worker_amd.py`](src/autokernel-rlvr/bench_worker/worker_amd.py) | ROCm bench worker |
+| [`agent_loop/reward_amd.py`](src/autokernel-rlvr/agent_loop/reward_amd.py) | log2-speedup reward; clip raised to 4.0 for FP8 kernels |
+| [`data/build_amd_dataset.py`](src/autokernel-rlvr/data/build_amd_dataset.py) | Prompts from GPU MODE AMD challenge submissions (FP8 GEMM, MoE, MLA decode) |
+| [`hardware/mi300x_specs.py`](src/autokernel-rlvr/hardware/mi300x_specs.py) | MI300X numbers given to the model |
+
+What changes for a kernel writer on MI300X: 64-thread wavefronts instead of 32-thread warps, 304 CUs,
+64 KB LDS per CU, a 256 MB Infinity Cache, 5.3 TB/s HBM3, and FP8 at 2,615 dense TFLOPs (2× BF16).
+
 ## Layout
 
 | Path | Contents |
