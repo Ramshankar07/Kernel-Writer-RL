@@ -1,4 +1,4 @@
-# Kernel-Writer-RL-v2
+# Kernel-Writer-RL
 
 An LLM agent (Qwen2.5-Coder-7B-Instruct) writes Triton kernels. A GPU benchmark checks correctness and speed, and the result is the reward for GRPO. April 2026.
 
